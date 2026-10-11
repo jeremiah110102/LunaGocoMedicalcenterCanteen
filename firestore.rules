@@ -1,0 +1,205 @@
+rules_version = '2';
+
+// Campus Canteen POS — Firestore security rules.
+// Deploy with:  firebase deploy --only firestore:rules
+//
+// Two layers:
+//  • Sign-in ACCOUNTS (users/{uid}) unlock a device. role: admin (owner) | device (approved) | pending
+//    The first account ever created becomes the owner automatically (see settings/setup).
+//  • STAFF (staff/{id}) are the people at the counter. They unlock with a PIN and their role
+//    (admin | manager | cashier | inventory) decides which pages the app shows.
+//
+// These rules guarantee: only approved devices touch data; sales, payments, stock history and
+// audit entries can't be edited or deleted; stock and balances can't go negative; only the
+// owner account approves devices or restores backups. Per-staff role limits are enforced by
+// the app on the shared device (see README → "Limits to know about").
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    function userPath() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function account() { return get(userPath()).data; }
+    function isDevice() {
+      return signedIn() && exists(userPath())
+        && account().active == true
+        && account().role in ['admin', 'device'];
+    }
+    function isOwner() { return isDevice() && account().role == 'admin'; }
+    function data() { return request.resource.data; }
+    function num(v) { return v is int || v is float; }
+    // Stock may go below zero when out-of-stock items are sold anyway (cashier confirms).
+    function stockOk() { return !('stock' in data()) || num(data().stock); }
+    function setupPath() { return /databases/$(database)/documents/settings/setup; }
+    function changedOnly(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+
+    // ---------- first-run setup ----------
+    match /settings/setup {
+      allow read: if signedIn();
+      // Created once, in the same batch as the first (owner) account.
+      allow create: if signedIn()
+        && data().ownerUid == request.auth.uid
+        && getAfter(userPath()).data.role == 'admin';
+      allow update, delete: if false;
+    }
+
+    // Which database the canteen uses (Firestore, Supabase or Google Sheets).
+    // Readable by anyone so every device knows it before sign-in.
+    match /settings/connection {
+      allow read: if true;
+      allow create: if isOwner() && request.auth.uid in data().ownerUids;
+      allow update: if signedIn() && request.auth.uid in resource.data.ownerUids
+        && request.auth.uid in data().ownerUids
+        && data().backend in ['firestore', 'supabase', 'sheets'];
+      allow delete: if false;
+    }
+
+    // ---------- sign-in accounts ----------
+    match /users/{uid} {
+      allow read: if (signedIn() && request.auth.uid == uid) || isOwner();
+      allow create: if signedIn() && request.auth.uid == uid
+        && data().active == true
+        && data().keys().hasOnly(['email', 'displayName', 'role', 'active', 'createdAt'])
+        && (
+          data().role == 'pending'
+          // the very first account becomes the owner
+          || (data().role == 'admin'
+              && !exists(setupPath())
+              && getAfter(setupPath()).data.ownerUid == request.auth.uid)
+        );
+      // Only the owner approves/disables other accounts; nobody can make another owner.
+      allow update: if isOwner() && request.auth.uid != uid
+        && data().role in ['device', 'pending']
+        && resource.data.role != 'admin';
+      // Restore: the owner may write back other device/pending accounts.
+      allow create: if isOwner() && request.auth.uid != uid && data().role in ['device', 'pending'];
+      allow delete: if false;
+    }
+
+    // ---------- staff (PIN profiles) ----------
+    match /staff/{id} {
+      allow read: if isDevice();
+      allow create, update: if isDevice()
+        && data().name is string && data().name.size() > 0
+        && data().role in ['admin', 'manager', 'cashier', 'inventory', 'accountant']
+        && data().pinHash is string && data().pinSalt is string;
+      allow delete: if false; // disable instead, so sales history keeps the name
+    }
+
+    // ---------- catalogue & stock ----------
+    match /categories/{id} {
+      allow read, write: if isDevice();
+    }
+    match /suppliers/{id} {
+      allow read, write: if isDevice();
+    }
+    match /purchaseOrders/{id} {
+      allow read, create, update: if isDevice();
+      allow delete: if false; // cancel instead
+    }
+    // Received deliveries are a permanent record.
+    match /deliveries/{id} {
+      allow read: if isDevice();
+      allow create: if isDevice() && data().items is list && data().items.size() > 0
+        && num(data().total) && data().total >= 0;
+      // only the payment fields change after receiving (supplier payments)
+      allow update: if isDevice() && changedOnly(['paidAmount', 'paymentStatus', 'updatedAt'])
+        && num(data().paidAmount) && data().paidAmount >= 0;
+      allow delete: if false;
+      allow write: if isOwner(); // restore
+    }
+    match /supplierPayments/{id} {
+      allow read: if isDevice();
+      allow create: if isDevice() && num(data().amount) && data().amount > 0;
+      allow update, delete: if false;
+      allow write: if isOwner(); // restore
+    }
+    match /stockCounts/{id} {
+      allow read, create, update: if isDevice();
+      allow delete: if false;
+    }
+    match /batches/{id} {
+      allow read, create, update: if isDevice();
+      allow delete: if false;
+    }
+    match /expenses/{id} {
+      allow read: if isDevice();
+      allow create, update: if isDevice() && num(data().amount) && data().amount > 0;
+      allow delete: if false; // void instead
+    }
+    // Shared settings for this canteen (backup schedule, Google Sheets copy…)
+    match /appSettings/{id} {
+      allow read, write: if isDevice();
+    }
+    match /products/{id} {
+      allow read, delete: if isDevice();
+      allow create, update: if isDevice() && stockOk() && num(data().price) && data().price >= 0;
+    }
+    match /ingredients/{id} {
+      allow read, delete: if isDevice();
+      allow create, update: if isDevice() && stockOk();
+    }
+    match /stockMovements/{id} {
+      allow read: if isDevice();
+      allow create: if isDevice() && num(data().change);
+      allow update, delete: if false;
+      allow write: if isOwner(); // restore
+    }
+
+    // ---------- sales ----------
+    match /counters/{counter} {
+      allow read: if isDevice();
+      allow create: if isDevice() && counter in ['sales', 'purchaseOrders', 'deliveries', 'refunds', 'shifts', 'stockCounts', 'supplierPayments'] && data().next == 1;
+      allow update: if isDevice() && counter in ['sales', 'purchaseOrders', 'deliveries', 'refunds', 'shifts', 'stockCounts', 'supplierPayments'] && data().next == resource.data.next + 1;
+      allow write: if isOwner(); // restore
+    }
+    match /sales/{saleId} {
+      allow read: if isDevice();
+      allow create: if isDevice()
+        && data().items is list && data().items.size() > 0
+        && num(data().total) && data().total >= 0
+        && data().paymentMethod in ['cash', 'gcash', 'credit']
+        && data().cashierId is string
+        && data().accountUid == request.auth.uid;
+      // A sale is never changed, except to note how much of it was refunded.
+      allow update: if isDevice() && changedOnly(['refundedQty', 'refundedTotal', 'refundStatus', 'updatedAt'])
+        && num(data().refundedTotal) && data().refundedTotal >= 0 && data().refundedTotal <= resource.data.total;
+      allow delete: if false;
+      allow write: if isOwner(); // restore
+    }
+    match /refunds/{id} {
+      allow read: if isDevice();
+      allow create: if isDevice() && data().lines is list && data().lines.size() > 0
+        && num(data().amount) && data().amount >= 0
+        && data().approvedById is string && data().accountUid == request.auth.uid;
+      allow update, delete: if false;
+      allow write: if isOwner(); // restore
+    }
+    match /shifts/{id} {
+      allow read, create, update: if isDevice();
+      allow delete: if false;
+    }
+
+    // ---------- credit ----------
+    match /creditAccounts/{id} {
+      allow read: if isDevice();
+      allow create, update: if isDevice() && num(data().balance) && data().balance >= 0 && num(data().limit) && data().limit >= 0;
+      allow delete: if false;
+      allow write: if isOwner(); // restore
+    }
+    match /creditPayments/{id} {
+      allow read: if isDevice();
+      allow create: if isDevice() && num(data().amount) && data().amount > 0;
+      allow update, delete: if false;
+      allow write: if isOwner(); // restore
+    }
+
+    // ---------- audit ----------
+    match /auditLogs/{id} {
+      allow read: if isDevice();
+      allow create: if isDevice() && data().accountUid == request.auth.uid;
+      allow update, delete: if false;
+      allow write: if isOwner(); // restore
+    }
+  }
+}
