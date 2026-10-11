@@ -254,4 +254,5 @@ google-apps-script/Database.gs ← Google Sheets database + rules
 
 Direct ESC/POS thermal printing over USB · multiple canteen branches · customer-facing order screen · pre-orders from students' phones · loyalty points.
 #   L u n a G o c o M e d i c a l c e n t e r C a n t e e n  
+ #   L u n a G o c o M e d i c a l c e n t e r C a n t e e n  
  
