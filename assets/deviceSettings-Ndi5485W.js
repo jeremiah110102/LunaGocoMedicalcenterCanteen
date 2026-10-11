@@ -1,0 +1,1 @@
+var e=`canteen.device`,t={paperWidth:80,autoPrint:!1,kitchenSlip:!1,largeText:!1,scanSound:!0};function n(){try{return{...t,...JSON.parse(localStorage.getItem(e))||{}}}catch{return{...t}}}function r(t){try{localStorage.setItem(e,JSON.stringify({...n(),...t}))}catch{}}export{r as n,n as t};

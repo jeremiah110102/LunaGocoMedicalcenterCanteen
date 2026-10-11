@@ -1,0 +1,1 @@
+var e=`/LunaGocoMedicalcenterCanteen/assets/zxing_reader-BxB2YfIY.wasm`;export{e as default};
